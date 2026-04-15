@@ -1,6 +1,6 @@
 # Plan: E2E Encrypted Multi-Peer Chat + File Transfer
 
-> **Project name TBD** — three separate repos
+> **Project name TBD** — monorepo
 
 ## Goals
 
@@ -14,15 +14,16 @@
 
 ---
 
-## Three Repos
+## Structure
 
-| Repo | Language | Purpose |
+| Directory | Language | Purpose |
 |---|---|---|
-| `[name]-server` | C + Zig | TCP relay server, channel management |
-| `[name]-cli` | C + Zig | Line-based CLI client |
-| `[name]-web` | Go + JS | Serves HTML/JS frontend to browser |
+| `server/` | C + Zig | TCP relay server, channel management |
+| `cli/` | C + Zig | Line-based CLI client |
+| `web/` | Go + JS | Serves HTML/JS frontend to browser |
+| `shared/` | C | Shared code: frame, transport, protocol |
 
-All three speak the same application protocol (MessagePack messages). Transport differs: CLI uses raw TCP, browser uses WebSocket (bridged to raw TCP by Go). Server is the only backend.
+All three components (server/cli/web) speak the same application protocol (MessagePack messages). Transport differs: CLI uses raw TCP, browser uses WebSocket (bridged to raw TCP by Go). Server is the only backend. `shared/` eliminates duplication of `frame.c/h`, `transport.c/h`, `protocol.c/h` between server and CLI.
 
 ---
 
@@ -419,7 +420,7 @@ No REST API. Channel created via first protocol message after transport + versio
 ```
 
 - `ttl` clamped to [60, 86400]; `max_peers` clamped to [2, server.max_peers_per_channel]; rate-limited to 10 creates/s per IP
-- three-layer limit: `ABS_MAX_PEERS_PER_CHANNEL` (compile-time) → `server.max_peers_per_channel` (CLI) → `channel.max_peers` (per-channel, protocol)
+- three-layer limit: `ABS_MAX_PEERS_PER_CHANNEL` (compile-time) → `server.max_peers_per_channel` (server args) → `channel.max_peers` (per-channel, protocol)
 - creator stays in `PEER_AWAITING_JOIN` after `created` — must send `join` with the returned `channel_id`+`join_code` to enter the channel
 
 ### Startup
@@ -454,15 +455,32 @@ Format: `<iso8601> LEVEL event k=v`. Output to stderr. `--silent` disables.
 ### File Structure
 
 ```
-server/
-├── build.zig
-└── src/
-    ├── main.c, event_loop.c/h, hub.c/h
-    ├── frame.c/h, transport.c/h, protocol.c/h, relay.c/h
-    ├── crypto_util.c/h, log.c/h
-    └── vendor/mpack.h   ← libmpack, header-only, vendored
-└── test/
-    ├── test_frame.c, test_hub.c, test_transport.c, test_protocol.c
+pac/                              ← monorepo root
+├── shared/
+│   ├── frame.c/h                 ← shared between server + cli
+│   ├── transport.c/h
+│   ├── protocol.c/h
+│   └── vendor/
+│       └── mpack.h               ← libmpack, header-only, vendored
+├── server/
+│   ├── build.zig
+│   ├── src/
+│   │   ├── main.c, event_loop.c/h, hub.c/h
+│   │   ├── relay.c/h, crypto_util.c/h, log.c/h
+│   └── test/
+│       ├── test_frame.c, test_hub.c, test_transport.c, test_protocol.c
+├── cli/
+│   ├── build.zig
+│   ├── src/
+│   │   ├── main.c, e2e.c/h
+│   │   ├── chat_loop.c/h, file_tx.c/h, identity.c/h, log.c/h
+│   └── test/test_e2e.c
+└── web/
+    ├── go.mod, main.go
+    └── static/
+        ├── index.html, app.js, style.css
+        ├── libsodium.js
+        └── msgpack.min.js
 ```
 
 ---
@@ -524,13 +542,9 @@ Peer verifies: `crypto_sign_ed25519_verify_detached(sig, msg, sizeof(msg), sende
 
 **Session:** generate `log_key`, seal to identity key, write header. Append each message encrypted with `log_key`.
 
-**Read:** `[name]-cli logs <channel_id> [--from date] [--to date]`
+**Read:** `cli logs <channel_id> [--from date] [--to date]`
 
 **Browser:** IndexedDB, same format. Use libsodium.js — NOT WebCrypto (no X25519 in Safari pre-2024).
-
-```
-cli/src/  identity.c/h, log.c/h
-```
 
 ---
 
@@ -554,27 +568,9 @@ Chat:
 
 Filename sanitization before saving: `basename()`, reject `.`/`..`/empty/NUL bytes, truncate to 255 chars. Save to `./received/<name>`.
 
-```
-cli/
-├── build.zig
-└── src/
-    ├── main.c, e2e.c/h
-    ├── frame.c/h, transport.c/h, protocol.c/h
-    ├── chat_loop.c/h, file_tx.c/h, identity.c/h, log.c/h
-└── test/test_e2e.c
-```
-
 ---
 
 ## Web Client
-
-```
-web/
-├── go.mod, main.go       — serve static/, bridge WebSocket ↔ raw TCP frames to C server
-└── static/
-    ├── index.html, app.js, style.css
-    └── libsodium.js      — from libsodium.js releases
-```
 
 `main.go`: browser connects via `wss://` (real TLS via CDN). Go upgrades to WebSocket, opens raw TCP connection to C server, forwards frames bidirectionally. C server sees a plain TCP peer — no WebSocket code in C.
 
@@ -588,10 +584,12 @@ web/
 const exe = b.addExecutable(.{ .name = "server", .target = target, .optimize = optimize });
 exe.addCSourceFiles(.{
     .files = &.{ "src/main.c", "src/event_loop.c", "src/hub.c",
-                 "src/frame.c", "src/transport.c", "src/protocol.c",
-                 "src/relay.c", "src/crypto_util.c", "src/log.c" },
+                 "src/relay.c", "src/crypto_util.c", "src/log.c",
+                 "../shared/frame.c", "../shared/transport.c", "../shared/protocol.c" },
     .flags = &.{ "-Wall", "-Wextra", "-std=c23", "-D_GNU_SOURCE" },
 });
+exe.addIncludePath(b.path("../shared"));          // frame.h, transport.h, protocol.h
+exe.addIncludePath(b.path("../shared/vendor"));   // mpack.h
 exe.linkSystemLibrary("sodium");
 exe.linkLibC();
 b.installArtifact(exe);
@@ -643,7 +641,7 @@ b.installArtifact(exe);
 
 **Step 11 — File transfer:** sender: `file_info` + binary chunks with `nonce_prefix||chunk_idx` nonce. Receiver: match chunks by `transfer_id` (from_pub stored from `file_info`), decrypt each chunk, reassemble, `file_ack`. Test: `sha256sum` of received file matches original.
 
-**Step 12 — Identity + logs:** `identity.c` (Argon2id unlock, generate Ed25519+X25519 keypairs, save/load). `log.c` (seal log key to x25519_pub via `crypto_box_seal`, append encrypted records). Subcommand `client logs <channel_id>`. Test: reconnect, `client logs` shows prior session; `join` sig verifies on peer.
+**Step 12 — Identity + logs:** `identity.c` (Argon2id unlock, generate Ed25519+X25519 keypairs, save/load). `log.c` (seal log key to x25519_pub via `crypto_box_seal`, append encrypted records). Subcommand `cli logs <channel_id>`. Test: reconnect, `cli logs` shows prior session; `join` sig verifies on peer.
 
 **Step 13 — Web client:** Go serves `static/`, opens raw TCP to C server, bridges WebSocket frames ↔ TCP frames bidirectionally. `app.js` uses `sodium.crypto_box_keypair`, same MessagePack protocol. Test: CLI peer and browser peer in same channel, messages decrypt on both.
 
@@ -666,7 +664,7 @@ b.installArtifact(exe);
 | 9 | chat frame reaches correct peer only |
 | 10 | two CLI clients chat E2E, decrypted |
 | 11 | file arrives intact (sha256 match) |
-| 12 | `client logs` shows previous session |
+| 12 | `cli logs` shows previous session |
 | 13 | CLI + browser chat in same channel |
 | 14 | `tcpdump` shows random noise; wrong password → silent drop |
 
@@ -680,9 +678,8 @@ b.installArtifact(exe);
 | libmpack | server, cli | header-only — `mpack.h` vendored in repo |
 | Zig 0.14+ | server, cli | ziglang.org/download |
 | Go 1.21+ | web | go.dev/dl |
-| vmihailenco/msgpack v5 | Go web server | `go get github.com/vmihailenco/msgpack/v5` |
 | gorilla/websocket | Go web server | `go get github.com/gorilla/websocket` |
-| @msgpack/msgpack | browser JS | `npm i @msgpack/msgpack` or CDN |
+| @msgpack/msgpack | browser JS | CDN or vendor in `web/static/` |
 | libsodium.js | browser | github.com/jedisct1/libsodium.js/releases |
 | `nc` / `xxd` | testing | builtin on Linux/macOS |
 
@@ -706,8 +703,8 @@ strace ./server               # no plaintext in write() syscalls
 # macOS:
 dtruss ./server               # same
 
-# Memory:
-CC_FLAGS="-fsanitize=address,undefined" zig build   # ASan + UBSan (Linux + macOS)
+# Memory (add to .flags in build.zig, then rebuild):
+# "-fsanitize=address,undefined"                     # ASan + UBSan (Linux + macOS)
 
 nc localhost 8080             # send garbage → server drops silently (noise mode)
 # connect beyond max_peers → error frame + close
