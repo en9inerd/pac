@@ -456,6 +456,8 @@ Format: `<iso8601> LEVEL event k=v`. Output to stderr. `--silent` disables.
 
 ```
 pac/                              ← monorepo root
+├── build.zig                     ← single root build, produces server + cli
+├── build.zig.zon
 ├── shared/
 │   ├── frame.c/h                 ← shared between server + cli
 │   ├── transport.c/h
@@ -463,14 +465,12 @@ pac/                              ← monorepo root
 │   └── vendor/
 │       └── mpack.h               ← libmpack, header-only, vendored
 ├── server/
-│   ├── build.zig
 │   ├── src/
 │   │   ├── main.c, event_loop.c/h, hub.c/h
 │   │   ├── relay.c/h, crypto_util.c/h, log.c/h
 │   └── test/
 │       ├── test_frame.c, test_hub.c, test_transport.c, test_protocol.c
 ├── cli/
-│   ├── build.zig
 │   ├── src/
 │   │   ├── main.c, e2e.c/h
 │   │   ├── chat_loop.c/h, file_tx.c/h, identity.c/h, log.c/h
@@ -482,6 +482,8 @@ pac/                              ← monorepo root
         ├── libsodium.js
         └── msgpack.min.js
 ```
+
+Single `build.zig` at repo root produces both binaries (Zig convention — sibling `build.zig` files cannot `@import` shared config, see Zig issue #10939). Per-binary targets: `zig build server`, `zig build cli`, `zig build` = both.
 
 ---
 
@@ -580,21 +582,17 @@ Filename sanitization before saving: `basename()`, reject `.`/`..`/empty/NUL byt
 
 ## Zig Build
 
-```zig
-const exe = b.addExecutable(.{ .name = "server", .target = target, .optimize = optimize });
-exe.addCSourceFiles(.{
-    .files = &.{ "src/main.c", "src/event_loop.c", "src/hub.c",
-                 "src/relay.c", "src/crypto_util.c", "src/log.c",
-                 "../shared/frame.c", "../shared/transport.c", "../shared/protocol.c" },
-    .flags = &.{ "-Wall", "-Wextra", "-std=c23", "-D_GNU_SOURCE" },
-});
-exe.addIncludePath(b.path("../shared"));          // frame.h, transport.h, protocol.h
-exe.addIncludePath(b.path("../shared/vendor"));   // mpack.h
-exe.linkSystemLibrary("sodium");
-exe.linkLibC();
-b.installArtifact(exe);
-// zig build -Dtarget=x86_64-linux-musl   → static binary, zero system deps
+Single root `build.zig`. Produces `server` and `cli`; `shared/` sources compiled into each.
+
+```bash
+zig build                          # both
+zig build server                   # server only
+zig build cli                      # cli only
+zig build -Doptimize=ReleaseSafe   # hardened release
+zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe  # static, zero deps
 ```
+
+Flags: `-std=c23`, warnings (`-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wformat=2 …`), sanitizers in Debug, hardening (`-D_FORTIFY_SOURCE=3 -fstack-protector-strong …`) in release. Linux adds `-D_GNU_SOURCE`, `-Wl,-z,relro/-z,now/-z,noexecstack`.
 
 ---
 
